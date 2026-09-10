@@ -1,6 +1,6 @@
 {
   "name": "memoryline",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "Conversation memory for LLM apps in TypeScript - a token-budgeted window of recent turns, a running summary that compacts older ones, pinned and extracted facts, and semantic recall of what was folded away. Bring your own model, embeddings and store. Zero dependencies.",
   "keywords": [
     "conversation-memory",
