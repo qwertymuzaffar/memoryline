@@ -3,52 +3,26 @@ import type {
   ArchivedMessage,
   CompactResult,
   ContextOptions,
-  Embedder,
-  FactExtractor,
+  Fact,
   FactInput,
   MemoryContext,
   MemoryOptions,
   Message,
   RecalledMessage,
-  Retriever,
   SessionState,
-  Store,
   StoredMessage,
-  Summarizer,
   ToolCall,
 } from './types.js';
+import { compact } from './compact.js';
+import { copyOptional, fresh, mergeFacts, normalizeFactKey, sum, toMessage, type Config, type Core } from './core.js';
 import { estimateTokens } from './tokens.js';
-import { messageText, toolGroupAt } from './tools.js';
+import { messageText } from './tools.js';
 import { extractiveSummary } from './summarize.js';
 import { renderFacts, renderMemory } from './render.js';
 import { cosine } from './similarity.js';
 import { MemoryStore } from './stores.js';
 
-interface Config {
-  store: Store;
-  maxTokens: number;
-  targetTokens: number;
-  keepRecent: number;
-  summaryMaxTokens: number;
-  perMessageOverhead: number;
-  countTokens: (text: string) => number;
-  summarize: Summarizer;
-  extractFacts: FactExtractor | undefined;
-  embed: Embedder | undefined;
-  retrieve: Retriever | undefined;
-  topK: number;
-  minScore: number;
-  recallMaxTokens: number;
-  archiveMax: number;
-  alignToUser: boolean;
-  onArchive: MemoryOptions['onArchive'];
-  clock: () => number;
-}
-
-interface Core {
-  cfg: Config;
-  run<T>(id: string, fn: () => Promise<T> | T): Promise<T>;
-}
+export { normalizeFactKey } from './core.js';
 
 const ROLES = new Set(['user', 'assistant', 'system', 'tool']);
 
@@ -84,15 +58,11 @@ function resolve(options: MemoryOptions): Config {
   };
 }
 
-function fresh(id: string, now: number): SessionState {
-  return { version: 1, id, recent: [], archive: [], summary: '', facts: [], seq: 1, compactions: 0, createdAt: now, updatedAt: now };
-}
-
 export function assertSessionState(state: unknown): asserts state is SessionState {
   if (!state || typeof state !== 'object') throw new TypeError('memoryline: session state must be an object');
-  const s = state as { version?: unknown; id?: unknown };
-  if (s.version !== 1) throw new TypeError(`memoryline: unsupported session state version ${String(s.version)}`);
-  if (typeof s.id !== 'string' || !s.id) throw new TypeError('memoryline: session state needs an id');
+  const candidate = state as { version?: unknown; id?: unknown };
+  if (candidate.version !== 1) throw new TypeError(`memoryline: unsupported session state version ${String(candidate.version)}`);
+  if (typeof candidate.id !== 'string' || !candidate.id) throw new TypeError('memoryline: session state needs an id');
 }
 
 function assertToolCalls(toolCalls: unknown): asserts toolCalls is ToolCall[] {
@@ -106,63 +76,13 @@ function assertToolCalls(toolCalls: unknown): asserts toolCalls is ToolCall[] {
   }
 }
 
-function assertMessage(m: unknown): asserts m is Message {
-  if (!m || typeof m !== 'object') throw new TypeError('memoryline: message must be an object');
-  const { role, content, toolCalls, toolCallId } = m as { role?: unknown; content?: unknown; toolCalls?: unknown; toolCallId?: unknown };
+function assertMessage(candidate: unknown): asserts candidate is Message {
+  if (!candidate || typeof candidate !== 'object') throw new TypeError('memoryline: message must be an object');
+  const { role, content, toolCalls, toolCallId } = candidate as { role?: unknown; content?: unknown; toolCalls?: unknown; toolCallId?: unknown };
   if (typeof role !== 'string' || !ROLES.has(role)) throw new TypeError(`memoryline: unknown message role ${String(role)}`);
   if (typeof content !== 'string') throw new TypeError('memoryline: message content must be a string');
   if (toolCalls !== undefined) assertToolCalls(toolCalls);
   if (toolCallId !== undefined && typeof toolCallId !== 'string') throw new TypeError('memoryline: toolCallId must be a string');
-}
-
-/** Copies the optional message fields that are stored as given. */
-function copyOptional(from: Message, to: Message): void {
-  if (from.name !== undefined) to.name = from.name;
-  if (from.toolCalls !== undefined) to.toolCalls = from.toolCalls;
-  if (from.toolCallId !== undefined) to.toolCallId = from.toolCallId;
-  if (from.meta !== undefined) to.meta = from.meta;
-}
-
-function toMessage(m: StoredMessage): Message {
-  const out: Message = { role: m.role, content: m.content, at: m.at };
-  copyOptional(m, out);
-  return out;
-}
-
-/**
- * Moves a fold boundary off the middle of a call/result group: forward past the group when
- * keepRecent allows, otherwise back to the group's start so the whole group stays in the window.
- */
-function wholeGroups(recent: StoredMessage[], boundary: number, keepRecent: number): number {
-  if (boundary <= 0 || boundary >= recent.length) return boundary;
-  const group = toolGroupAt(recent, boundary);
-  if (!group || group.start === boundary) return boundary;
-  return recent.length - group.end >= keepRecent ? group.end : group.start;
-}
-
-export function normalizeFactKey(key: string): string {
-  return key
-    .trim()
-    .toLowerCase()
-    .replace(/[\s\-./]+/g, '_')
-    .replace(/[^a-z0-9_]/g, '')
-    .replace(/^_+|_+$/g, '');
-}
-
-function mergeFacts(state: SessionState, inputs: FactInput[], source: 'pinned' | 'extracted', now: number): void {
-  for (const input of inputs) {
-    const key = normalizeFactKey(String(input?.key ?? ''));
-    const value = String(input?.value ?? '').trim();
-    if (!key || !value) continue;
-    const existing = state.facts.find((f) => f.key === key);
-    if (!existing) {
-      state.facts.push({ key, value, source, at: now });
-    } else if (source === 'pinned' || existing.source === 'extracted') {
-      existing.value = value;
-      existing.source = source;
-      existing.at = now;
-    }
-  }
 }
 
 async function load(core: Core, id: string): Promise<SessionState> {
@@ -172,64 +92,6 @@ async function load(core: Core, id: string): Promise<SessionState> {
   return state;
 }
 
-function sum(messages: StoredMessage[]): number {
-  let total = 0;
-  for (const m of messages) total += m.tokens;
-  return total;
-}
-
-async function compact(core: Core, state: SessionState, force: boolean): Promise<CompactResult> {
-  const { cfg } = core;
-  const { recent } = state;
-  const none = (): CompactResult => ({ folded: 0, summary: state.summary, facts: [...state.facts] });
-  let tokens = sum(recent);
-  if (!force && tokens <= cfg.maxTokens) return none();
-
-  let n = 0;
-  while (recent.length - n > cfg.keepRecent && (force || tokens > cfg.targetTokens)) {
-    tokens -= recent[n]!.tokens;
-    n++;
-  }
-  if (cfg.alignToUser) {
-    while (n > 0 && n < recent.length && recent[n]!.role !== 'user' && recent.length - n > cfg.keepRecent) n++;
-  }
-  n = wholeGroups(recent, n, cfg.keepRecent);
-  if (n === 0) return none();
-
-  const now = cfg.clock();
-  const folded = recent.splice(0, n);
-  const plain = folded.map(toMessage);
-  const compaction = ++state.compactions;
-
-  const summary = await cfg.summarize({
-    previousSummary: state.summary,
-    messages: plain,
-    facts: [...state.facts],
-    maxTokens: cfg.summaryMaxTokens,
-  });
-  state.summary = String(summary ?? '').trim();
-
-  if (cfg.extractFacts) {
-    const extracted = await cfg.extractFacts({ messages: plain, facts: [...state.facts], summary: state.summary });
-    mergeFacts(state, extracted ?? [], 'extracted', now);
-  }
-
-  let embeddings: number[][] | undefined;
-  if (cfg.embed) embeddings = await cfg.embed(folded.map(messageText));
-
-  const archived: ArchivedMessage[] = folded.map((m, i) => {
-    const item: ArchivedMessage = { ...m, compaction };
-    const vector = embeddings?.[i];
-    if (vector) item.embedding = vector;
-    return item;
-  });
-  state.archive.push(...archived);
-  if (state.archive.length > cfg.archiveMax) state.archive.splice(0, state.archive.length - cfg.archiveMax);
-  if (cfg.onArchive) await cfg.onArchive(state.id, archived);
-
-  return { folded: n, summary: state.summary, facts: [...state.facts] };
-}
-
 function rank(archive: ArchivedMessage[], query: number[], topK: number, minScore: number): RecalledMessage[] {
   const scored: RecalledMessage[] = [];
   for (const message of archive) {
@@ -237,7 +99,7 @@ function rank(archive: ArchivedMessage[], query: number[], topK: number, minScor
     const score = cosine(query, message.embedding);
     if (score >= minScore) scored.push({ message, score });
   }
-  scored.sort((a, b) => b.score - a.score || a.message.id - b.message.id);
+  scored.sort((left, right) => right.score - left.score || left.message.id - right.message.id);
   return scored.slice(0, topK);
 }
 
@@ -253,8 +115,8 @@ function withinTokens(items: RecalledMessage[], max: number): RecalledMessage[] 
 }
 
 function lastUserContent(recent: StoredMessage[]): string | undefined {
-  for (let i = recent.length - 1; i >= 0; i--) {
-    if (recent[i]!.role === 'user') return recent[i]!.content;
+  for (let index = recent.length - 1; index >= 0; index--) {
+    if (recent[index]!.role === 'user') return recent[index]!.content;
   }
   return undefined;
 }
@@ -268,90 +130,75 @@ export class Session {
   /** Appends one or more messages and compacts when the recent window is over budget. */
   add(input: Message | Message[]): Promise<AddResult> {
     const messages = Array.isArray(input) ? input : [input];
-    for (const m of messages) assertMessage(m);
-    return this.core.run(this.id, async () => {
-      const { cfg } = this.core;
-      const state = await load(this.core, this.id);
-      if (messages.length === 0) return { added: 0, compacted: false, folded: 0, summary: state.summary, facts: [...state.facts] };
-      const now = cfg.clock();
-      for (const m of messages) {
-        const stored: StoredMessage = {
-          role: m.role,
-          content: m.content,
-          id: state.seq++,
-          at: m.at ?? now,
-          tokens: cfg.countTokens(messageText(m)) + cfg.perMessageOverhead,
-        };
-        copyOptional(m, stored);
-        state.recent.push(stored);
-      }
-      const result = await compact(this.core, state, false);
-      state.updatedAt = now;
-      await cfg.store.save(state);
-      return { added: messages.length, compacted: result.folded > 0, ...result };
-    });
+    for (const message of messages) assertMessage(message);
+    return this.mutate(
+      async (state, now) => {
+        const { cfg } = this.core;
+        if (messages.length === 0) return { added: 0, compacted: false, folded: 0, summary: state.summary, facts: [...state.facts] };
+        for (const message of messages) {
+          const stored: StoredMessage = {
+            role: message.role,
+            content: message.content,
+            id: state.seq++,
+            at: message.at ?? now,
+            tokens: cfg.countTokens(messageText(message)) + cfg.perMessageOverhead,
+          };
+          copyOptional(message, stored);
+          state.recent.push(stored);
+        }
+        const result = await compact(this.core, state, false);
+        return { added: messages.length, compacted: result.folded > 0, ...result };
+      },
+      (result) => result.added > 0,
+    );
   }
 
   /** Folds older messages into the summary. `force` folds everything but the last `keepRecent`. */
   compact(options: { force?: boolean } = {}): Promise<CompactResult> {
-    return this.core.run(this.id, async () => {
-      const state = await load(this.core, this.id);
-      const result = await compact(this.core, state, options.force ?? false);
-      if (result.folded > 0) {
-        state.updatedAt = this.core.cfg.clock();
-        await this.core.cfg.store.save(state);
-      }
-      return result;
-    });
+    return this.mutate((state) => compact(this.core, state, options.force ?? false), (result) => result.folded > 0);
   }
 
   /** Records facts by hand. Pinned facts are never overwritten by extracted ones. */
-  pin(key: string, value: string): Promise<import('./types.js').Fact[]>;
-  pin(facts: FactInput | FactInput[]): Promise<import('./types.js').Fact[]>;
-  pin(a: string | FactInput | FactInput[], b?: string): Promise<import('./types.js').Fact[]> {
-    const inputs: FactInput[] = typeof a === 'string' ? [{ key: a, value: b ?? '' }] : Array.isArray(a) ? a : [a];
-    return this.core.run(this.id, async () => {
-      const state = await load(this.core, this.id);
-      const now = this.core.cfg.clock();
+  pin(key: string, value: string): Promise<Fact[]>;
+  pin(facts: FactInput | FactInput[]): Promise<Fact[]>;
+  pin(keyOrFacts: string | FactInput | FactInput[], value?: string): Promise<Fact[]> {
+    const inputs: FactInput[] =
+      typeof keyOrFacts === 'string' ? [{ key: keyOrFacts, value: value ?? '' }] : Array.isArray(keyOrFacts) ? keyOrFacts : [keyOrFacts];
+    return this.mutate((state, now) => {
       mergeFacts(state, inputs, 'pinned', now);
-      state.updatedAt = now;
-      await this.core.cfg.store.save(state);
       return [...state.facts];
     });
   }
 
   unpin(key: string): Promise<boolean> {
-    const k = normalizeFactKey(key);
-    return this.core.run(this.id, async () => {
-      const state = await load(this.core, this.id);
-      const index = state.facts.findIndex((f) => f.key === k);
+    const normalized = normalizeFactKey(key);
+    const removeFact = (state: SessionState): boolean => {
+      const index = state.facts.findIndex((fact) => fact.key === normalized);
       if (index < 0) return false;
       state.facts.splice(index, 1);
-      state.updatedAt = this.core.cfg.clock();
-      await this.core.cfg.store.save(state);
       return true;
-    });
+    };
+    return this.mutate(removeFact, (removed) => removed);
   }
 
-  facts(): Promise<import('./types.js').Fact[]> {
-    return this.core.run(this.id, async () => [...(await load(this.core, this.id)).facts]);
+  facts(): Promise<Fact[]> {
+    return this.read((state) => [...state.facts]);
   }
 
   /** The recent window. */
   messages(): Promise<StoredMessage[]> {
-    return this.core.run(this.id, async () => [...(await load(this.core, this.id)).recent]);
+    return this.read((state) => [...state.recent]);
   }
 
   /** A copy of the whole state, including the archive. */
   state(): Promise<SessionState> {
-    return this.core.run(this.id, () => load(this.core, this.id));
+    return this.read((state) => state);
   }
 
   /** Everything the next model call should see. Reads only; never changes the session. */
   context(options: ContextOptions = {}): Promise<MemoryContext> {
-    return this.core.run(this.id, async () => {
+    return this.read(async (state) => {
       const { cfg } = this.core;
-      const state = await load(this.core, this.id);
       const recent = state.recent.map(toMessage);
 
       let recalled: RecalledMessage[] = [];
@@ -366,7 +213,7 @@ export class Session {
         } else if (embedding) {
           recalled = rank(state.archive, embedding, topK, cfg.minScore);
         }
-        recalled = withinTokens(recalled, cfg.recallMaxTokens).sort((a, b) => a.message.id - b.message.id);
+        recalled = withinTokens(recalled, cfg.recallMaxTokens).sort((left, right) => left.message.id - right.message.id);
       }
 
       const facts = [...state.facts];
@@ -382,7 +229,7 @@ export class Session {
         tokens: {
           summary: cfg.countTokens(state.summary),
           facts: cfg.countTokens(renderFacts(facts)),
-          recalled: recalled.reduce((t, r) => t + r.message.tokens, 0),
+          recalled: recalled.reduce((total, item) => total + item.message.tokens, 0),
           recent: recentTokens,
           total: cfg.countTokens(system) + recentTokens,
         },
@@ -393,6 +240,28 @@ export class Session {
   /** Deletes the session from the store. */
   clear(): Promise<void> {
     return this.core.run(this.id, () => this.core.cfg.store.delete(this.id));
+  }
+
+  /** Under the session lock: loads the state and hands it to `body`. Never saves. */
+  private read<T>(body: (state: SessionState) => Promise<T> | T): Promise<T> {
+    return this.core.run(this.id, async () => body(await load(this.core, this.id)));
+  }
+
+  /**
+   * Under the session lock: loads the state, runs `body` with it and the current time, and
+   * saves it with `updatedAt` stamped when `persist` accepts the result (always, by default).
+   */
+  private mutate<T>(body: (state: SessionState, now: number) => Promise<T> | T, persist: (result: T) => boolean = () => true): Promise<T> {
+    return this.core.run(this.id, async () => {
+      const state = await load(this.core, this.id);
+      const now = this.core.cfg.clock();
+      const result = await body(state, now);
+      if (persist(result)) {
+        state.updatedAt = now;
+        await this.core.cfg.store.save(state);
+      }
+      return result;
+    });
   }
 }
 
