@@ -1,0 +1,62 @@
+{
+  "name": "memoryline",
+  "version": "0.1.0",
+  "description": "Conversation memory for LLM apps in TypeScript - a token-budgeted window of recent turns, a running summary that compacts older ones, pinned and extracted facts, and semantic recall of what was folded away. Bring your own model, embeddings and store. Zero dependencies.",
+  "keywords": [
+    "conversation-memory",
+    "chat-memory",
+    "context-window",
+    "compaction",
+    "summarization",
+    "llm",
+    "agents",
+    "rag",
+    "chatbot",
+    "openai",
+    "anthropic",
+    "memory",
+    "typescript"
+  ],
+  "license": "MIT",
+  "author": "Muzaffar Qosimov",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/qwertymuzaffar/memoryline.git"
+  },
+  "type": "module",
+  "main": "./dist/index.cjs",
+  "module": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js",
+      "require": "./dist/index.cjs"
+    }
+  },
+  "files": [
+    "dist"
+  ],
+  "sideEffects": false,
+  "engines": {
+    "node": ">=18"
+  },
+  "scripts": {
+    "build": "tsup",
+    "test": "vitest run",
+    "coverage": "vitest run --coverage",
+    "typecheck": "tsc --noEmit",
+    "prepublishOnly": "npm run build && npm test",
+    "changeset": "changeset",
+    "version-packages": "changeset version",
+    "release": "npm run build && changeset publish"
+  },
+  "devDependencies": {
+    "@changesets/cli": "^3.0.2",
+    "@types/node": "^22.20.1",
+    "@vitest/coverage-v8": "4.1.11",
+    "tsup": "^8.5.0",
+    "typescript": "^5.9.2",
+    "vitest": "^4.0.8"
+  }
+}
