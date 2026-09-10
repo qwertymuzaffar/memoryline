@@ -178,7 +178,36 @@ Dana wants a table for six on Friday evening and asked about the patio.
 - assistant: There is a garage next door, two dollars an hour.
 ```
 
-`toOpenAI(ctx, { systemPrompt })` returns a messages array with one system message (your prompt plus the block) followed by the recent window. `toAnthropic(ctx, { systemPrompt })` returns `{ system, messages }` with strictly alternating user/assistant turns: system-role messages in the window join the system string, tool messages become user messages tagged `[toolname]`, consecutive same-role messages merge, and a window that begins on an assistant turn gets a one-line user message in front. `renderMemory(parts, { headings })` renders the block on its own with headings of your choosing.
+`toOpenAI(ctx, { systemPrompt })` returns a messages array with one system message (your prompt plus the block) followed by the recent window. `toAnthropic(ctx, { systemPrompt })` returns `{ system, messages }` with strictly alternating user/assistant turns: system-role messages in the window join the system string, tool results without an id become user messages tagged `[toolname]`, consecutive same-role messages merge, and a window that begins on an assistant turn gets a one-line user message in front. Tool calls and their results keep each provider's native shape - see the next section. `renderMemory(parts, { headings })` renders the block on its own with headings of your choosing.
+
+## Tool calls
+
+An assistant turn that calls tools carries `toolCalls`, and each result is a `tool` message with the matching `toolCallId`. Store them as the provider returned them; the renderers put them back into each provider's shape, and compaction never separates a call from its result. When a fold boundary lands inside a call/result group, the whole group folds together, or, when `keepRecent` forbids that, the whole group stays in the window.
+
+```ts
+await session.add([
+  { role: 'user', content: 'Any tables for six on Friday?' },
+  { role: 'assistant', content: '', toolCalls: [{ id: 'call_1', name: 'find_slots', arguments: { party: 6, day: 'friday' } }] },
+  { role: 'tool', toolCallId: 'call_1', name: 'find_slots', content: '7pm and 9pm are free' },
+  { role: 'assistant', content: 'Seven or nine - which do you prefer?' },
+]);
+```
+
+`toOpenAI` renders the call as `tool_calls` with the arguments as a JSON string, and the result as a `tool` message with `tool_call_id`:
+
+```ts
+{ role: 'assistant', content: '', tool_calls: [{ id: 'call_1', type: 'function', function: { name: 'find_slots', arguments: '{"party":6,"day":"friday"}' } }] },
+{ role: 'tool', content: '7pm and 9pm are free', name: 'find_slots', tool_call_id: 'call_1' },
+```
+
+`toAnthropic` renders the call as a `tool_use` block in the assistant turn and the result as a `tool_result` block in the following user turn. Turns without tool blocks stay plain strings:
+
+```ts
+{ role: 'assistant', content: [{ type: 'tool_use', id: 'call_1', name: 'find_slots', input: { party: 6, day: 'friday' } }] },
+{ role: 'user', content: [{ type: 'tool_result', tool_use_id: 'call_1', content: '7pm and 9pm are free' }] },
+```
+
+`arguments` can be the JSON string the provider streamed or an object you already parsed. String arguments are parsed into Anthropic's `input`; a string that is not a JSON object is passed as `{ arguments: '...' }` so nothing is lost. In summaries, transcripts and the memory block a call shows as `[call find_slots({"party":6,"day":"friday"})]` after the message text (`messageText(message)` gives you the same string), and that text counts toward the window's tokens. A `tool` message without `toolCallId` behaves as before: a tagged user message for Anthropic, a plain `tool` message for OpenAI.
 
 ## Stores
 
@@ -254,7 +283,8 @@ await memory.import(state);                    // into another memory or store
 - The summary is only as good as the model behind `summarize`. The extractive fallback keeps text, not meaning; production apps should pass a model call.
 - Summaries drift. Every compaction rewrites the whole summary from the previous one plus the folded turns, so a mistake can persist. Pinned facts exist so the details that must not drift live outside the summary.
 - Recall is per session. Cross-session memory ("what did this user say last month") is a `retrieve` function over your own index; the `onArchive` hook is where to feed it.
-- Tool-call payloads are stored as plain content. OpenAI's `tool_call_id` and Anthropic's tool-use blocks are not modeled; put a short textual result in the message and keep the raw payload in `meta`.
+- `toolCalls` and `toolCallId` cover function calls and their results (see Tool calls). Provider extras such as OpenAI's `refusal` or Anthropic's `cache_control` are not modeled; keep them in `meta`.
+- A tool result whose call is no longer in the window is treated as a plain message. Keep `keepRecent` at least as large as your longest call/result group plus the turns around it so groups fold together rather than being kept back.
 - `perMessageOverhead` approximates chat-format framing tokens. It is a constant, not a per-model table.
 - The archive is capped per session (`archive.max`) and stored inline with the session, embeddings included. For long-lived sessions with large embeddings, lower the cap or move recall to an external index.
 - No encryption, no PII handling. Pair with [deidentify](https://www.npmjs.com/package/deidentify) if messages carry personal data that should not reach the model or the store.

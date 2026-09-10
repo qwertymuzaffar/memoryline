@@ -1,10 +1,22 @@
 export type Role = 'user' | 'assistant' | 'system' | 'tool';
 
+/** A function call the assistant made. `id` pairs it with the `tool` message that answers it. */
+export interface ToolCall {
+  id: string;
+  name: string;
+  /** Arguments as the model produced them: a JSON string or an already-parsed object. */
+  arguments: string | Record<string, unknown>;
+}
+
 export interface Message {
   role: Role;
   content: string;
   /** Speaker or tool name. Passed through untouched. */
   name?: string;
+  /** Calls the assistant made in this turn. Only meaningful on assistant messages. */
+  toolCalls?: ToolCall[];
+  /** The `ToolCall.id` this result answers. Only meaningful on tool messages. */
+  toolCallId?: string;
   /** Unix milliseconds. Set when the message is added if absent. */
   at?: number;
   /** Anything you want to keep with the message. Stored, never read. */

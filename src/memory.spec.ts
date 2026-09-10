@@ -38,6 +38,33 @@ describe('add and windowing', () => {
     expect((await s.messages())[0]!.tokens).toBe(6);
   });
 
+  it('stores tool calls and results as given and counts call text as tokens', async () => {
+    const s = createMemory({ countTokens: words, budget: budget(100) }).session('a');
+    const calls = [{ id: 'call_1', name: 'find_slots', arguments: { party: 6 } }];
+    await s.add([
+      { role: 'assistant', content: 'Let me check', toolCalls: calls },
+      { role: 'tool', name: 'find_slots', toolCallId: 'call_1', content: '7pm free' },
+    ]);
+    const [call, result] = await s.messages();
+    expect(call).toMatchObject({ role: 'assistant', toolCalls: calls, tokens: 5 });
+    expect(call).not.toHaveProperty('toolCallId');
+    expect(result).toMatchObject({ role: 'tool', toolCallId: 'call_1', name: 'find_slots', tokens: 2 });
+    expect(result).not.toHaveProperty('toolCalls');
+    const exported = (await createMemory().export('missing')) ?? null;
+    expect(exported).toBeNull();
+  });
+
+  it('rejects malformed tool calls', () => {
+    const s = createMemory().session('a');
+    const assistant = (extra: Record<string, unknown>) => ({ role: 'assistant', content: '', ...extra }) as unknown as Message;
+    expect(() => s.add(assistant({ toolCalls: {} }))).toThrow(/array/);
+    expect(() => s.add(assistant({ toolCalls: [{ name: 'f', arguments: '{}' }] }))).toThrow(/string id/);
+    expect(() => s.add(assistant({ toolCalls: [{ id: 'c', arguments: '{}' }] }))).toThrow(/string name/);
+    expect(() => s.add(assistant({ toolCalls: [{ id: 'c', name: 'f', arguments: 5 }] }))).toThrow(/arguments/);
+    expect(() => s.add(assistant({ toolCalls: [{ id: 'c', name: 'f', arguments: ['x'] }] }))).toThrow(/arguments/);
+    expect(() => s.add({ role: 'tool', content: 'r', toolCallId: 7 } as unknown as Message)).toThrow(/toolCallId/);
+  });
+
   it('rejects malformed messages and empty ids', () => {
     const memory = createMemory();
     expect(() => memory.session('')).toThrow(/session id/);
@@ -127,6 +154,59 @@ describe('compaction', () => {
     const s = memory.session('a');
     await s.add([user('I need a table'), bot('For how many?'), user('Six')]);
     expect((await s.state()).summary).toBe('- user: I need a table\n- assistant: For how many?');
+  });
+
+  it('folds a whole call/result group together when the boundary lands inside it', async () => {
+    const calls: SummarizeInput[] = [];
+    const memory = createMemory({
+      countTokens: words,
+      budget: { ...budget(5, 2), targetTokens: 4 },
+      alignToUser: false,
+      summarize: (input) => {
+        calls.push(input);
+        return 'S';
+      },
+    });
+    const s = memory.session('a');
+    const toolCall = { id: 'call_1', name: 'f', arguments: '{}' };
+    // 6 tokens: the fold reaches targetTokens on the tool result, so the whole group folds with it
+    const result = await s.add([
+      user('a'),
+      { role: 'assistant', content: '', toolCalls: [toolCall] },
+      { role: 'tool', toolCallId: 'call_1', content: 'r' },
+      bot('b'),
+      user('c'),
+    ]);
+    expect(result.folded).toBe(3);
+    expect(calls[0]!.messages.map((message) => message.content)).toEqual(['a', '', 'r']);
+    expect(calls[0]!.messages[1]).toMatchObject({ toolCalls: [toolCall] });
+    expect(calls[0]!.messages[2]).toMatchObject({ toolCallId: 'call_1' });
+    expect((await s.messages()).map((message) => message.content)).toEqual(['b', 'c']);
+    expect((await s.state()).archive.map((message) => message.toolCallId ?? message.toolCalls?.[0]?.id ?? message.content)).toEqual(['a', 'call_1', 'call_1']);
+  });
+
+  it('keeps a whole call/result group in the window when keepRecent forbids folding it', async () => {
+    const call = { role: 'assistant' as const, content: '', toolCalls: [{ id: 'call_1', name: 'f', arguments: '{}' }] };
+    const toolResult = { role: 'tool' as const, toolCallId: 'call_1', content: 'r' };
+    // 5 tokens, fold reaches targetTokens on the result; folding past it would leave fewer than keepRecent
+    const s = createMemory({ countTokens: words, budget: { ...budget(4, 2), targetTokens: 3 }, alignToUser: false, summarize: () => 'S' }).session('a');
+    expect(await s.add([user('a'), call, toolResult, bot('b')])).toMatchObject({ folded: 1 });
+    const window = await s.messages();
+    expect(window.map((message) => message.role)).toEqual(['assistant', 'tool', 'assistant']);
+    expect(window[0]).toMatchObject({ toolCalls: [{ id: 'call_1' }] });
+
+    // nothing before the group: nothing folds rather than splitting it
+    const fresh = createMemory({ countTokens: words, budget: { ...budget(3, 2), targetTokens: 3 }, alignToUser: false, summarize: () => 'S' }).session('b');
+    await fresh.add([call, toolResult]);
+    expect(await fresh.add(user('c'))).toMatchObject({ folded: 0 });
+    expect(await fresh.messages()).toHaveLength(3);
+  });
+
+  it('treats a tool result whose call is not in the window as a plain message', async () => {
+    const memory = createMemory({ countTokens: words, budget: { ...budget(2, 1), targetTokens: 2 }, alignToUser: false, summarize: () => 'S' });
+    const s = memory.session('a');
+    await s.add([user('a'), { role: 'tool', toolCallId: 'orphan', content: 'r' }, bot('b')]);
+    expect((await s.messages()).map((message) => message.content)).toEqual(['r', 'b']);
   });
 
   it('keeps the archive capped and reports folded messages through onArchive', async () => {
