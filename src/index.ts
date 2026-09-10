@@ -6,4 +6,6 @@ export { estimateTokens } from './tokens.js';
 export { cosine } from './similarity.js';
 export { extractiveSummary, summaryPrompt, factsPrompt, parseFacts, transcript, oneLine } from './summarize.js';
 export { renderMemory, renderFacts, renderRecalled, toOpenAI, toAnthropic } from './render.js';
-export type { RenderOptions, OpenAIMessage, AnthropicMessage } from './render.js';
+export type { RenderOptions, OpenAIMessage, OpenAIToolCall, AnthropicMessage, AnthropicContentBlock } from './render.js';
+export { messageText, argumentsText, parseArguments, toolGroupAt } from './tools.js';
+export type { ToolGroup } from './tools.js';

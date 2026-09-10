@@ -1,5 +1,6 @@
 import type { ExtractFactsInput, FactInput, Message, SummarizeInput } from './types.js';
 import { estimateTokens } from './tokens.js';
+import { messageText } from './tools.js';
 
 const MAX_LINE = 160;
 
@@ -14,7 +15,7 @@ function speaker(m: Message): string {
 
 /** Messages as a plain "role: text" transcript, one message per line. */
 export function transcript(messages: Message[]): string {
-  return messages.map((m) => `${speaker(m)}: ${m.content.trim()}`).join('\n');
+  return messages.map((m) => `${speaker(m)}: ${messageText(m).trim()}`).join('\n');
 }
 
 /**
@@ -29,7 +30,7 @@ export function extractiveSummary(input: SummarizeInput, countTokens: (text: str
       .split('\n')
       .map((l) => l.trim())
       .filter(Boolean),
-    ...input.messages.filter((m) => m.role !== 'system').map((m) => `- ${speaker(m)}: ${oneLine(m.content, MAX_LINE)}`),
+    ...input.messages.filter((m) => m.role !== 'system').map((m) => `- ${speaker(m)}: ${oneLine(messageText(m), MAX_LINE)}`),
   ];
   while (lines.length > 1 && countTokens(lines.join('\n')) > input.maxTokens) lines.shift();
   return lines.join('\n');

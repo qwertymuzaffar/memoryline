@@ -114,3 +114,46 @@ describe('RedisStore', () => {
     expect(() => new RedisStore({ get, set, del }, { ttlSeconds: 5 })).toThrow(/expire/);
   });
 });
+
+describe('tool call fields', () => {
+  const state: SessionState = {
+    version: 1,
+    id: 'tools',
+    recent: [
+      { id: 1, role: 'assistant', content: '', toolCalls: [{ id: 'call_1', name: 'find', arguments: { q: 1 } }], at: 0, tokens: 3 },
+      { id: 2, role: 'tool', toolCallId: 'call_1', name: 'find', content: 'found', at: 0, tokens: 2 },
+    ],
+    archive: [],
+    summary: '',
+    facts: [],
+    seq: 3,
+    compactions: 0,
+    createdAt: 0,
+    updatedAt: 0,
+  };
+
+  it('survive MemoryStore, SqlStore and RedisStore unchanged', async () => {
+    const memoryStore = new MemoryStore();
+    memoryStore.save(state);
+    expect(memoryStore.load('tools')).toEqual(state);
+
+    const rows = new Map<string, string>();
+    const sqlStore = new SqlStore({
+      query: async (sql, params) => {
+        if (sql.startsWith('INSERT')) rows.set(String(params[0]), String(params[1]));
+        return { rows: rows.has(String(params[0])) ? [{ state: rows.get(String(params[0])) }] : [] };
+      },
+    });
+    await sqlStore.save(state);
+    expect(await sqlStore.load('tools')).toEqual(state);
+
+    const keys = new Map<string, string>();
+    const redisStore = new RedisStore({
+      get: async (key) => keys.get(key) ?? null,
+      set: async (key, value) => void keys.set(key, value),
+      del: async (key) => void keys.delete(key),
+    });
+    await redisStore.save(state);
+    expect(await redisStore.load('tools')).toEqual(state);
+  });
+});

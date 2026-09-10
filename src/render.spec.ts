@@ -54,6 +54,41 @@ describe('toOpenAI', () => {
   it('omits the system message when there is nothing to say', () => {
     expect(toOpenAI(ctx({ recent: [{ role: 'user', content: 'hi' }] }))).toEqual([{ role: 'user', content: 'hi' }]);
   });
+
+  it('renders tool calls as tool_calls and results with tool_call_id', () => {
+    const out = toOpenAI(
+      ctx({
+        recent: [
+          { role: 'user', content: 'Any tables?' },
+          {
+            role: 'assistant',
+            content: '',
+            toolCalls: [
+              { id: 'call_1', name: 'find_slots', arguments: { party: 6 } },
+              { id: 'call_2', name: 'weather', arguments: '{"day":"friday"}' },
+            ],
+          },
+          { role: 'tool', name: 'find_slots', toolCallId: 'call_1', content: '7pm free' },
+          { role: 'tool', name: 'weather', toolCallId: 'call_2', content: 'clear' },
+          { role: 'assistant', content: '7pm works.' },
+        ],
+      }),
+    );
+    expect(out).toEqual([
+      { role: 'user', content: 'Any tables?' },
+      {
+        role: 'assistant',
+        content: '',
+        tool_calls: [
+          { id: 'call_1', type: 'function', function: { name: 'find_slots', arguments: '{"party":6}' } },
+          { id: 'call_2', type: 'function', function: { name: 'weather', arguments: '{"day":"friday"}' } },
+        ],
+      },
+      { role: 'tool', content: '7pm free', name: 'find_slots', tool_call_id: 'call_1' },
+      { role: 'tool', content: 'clear', name: 'weather', tool_call_id: 'call_2' },
+      { role: 'assistant', content: '7pm works.' },
+    ]);
+  });
 });
 
 describe('toAnthropic', () => {
@@ -83,5 +118,88 @@ describe('toAnthropic', () => {
 
   it('handles an empty window', () => {
     expect(toAnthropic(ctx())).toEqual({ system: '', messages: [] });
+  });
+
+  it('renders tool calls as tool_use blocks and results as tool_result blocks in the next user turn', () => {
+    const out = toAnthropic(
+      ctx({
+        recent: [
+          { role: 'user', content: 'Any tables?' },
+          {
+            role: 'assistant',
+            content: 'Let me check.',
+            toolCalls: [
+              { id: 'call_1', name: 'find_slots', arguments: '{"party":6}' },
+              { id: 'call_2', name: 'weather', arguments: { day: 'friday' } },
+            ],
+          },
+          { role: 'tool', name: 'find_slots', toolCallId: 'call_1', content: '7pm free' },
+          { role: 'tool', name: 'weather', toolCallId: 'call_2', content: 'clear' },
+          { role: 'assistant', content: '7pm works.' },
+          { role: 'user', content: 'Book it.' },
+        ],
+      }),
+    );
+    expect(out.messages).toEqual([
+      { role: 'user', content: 'Any tables?' },
+      {
+        role: 'assistant',
+        content: [
+          { type: 'text', text: 'Let me check.' },
+          { type: 'tool_use', id: 'call_1', name: 'find_slots', input: { party: 6 } },
+          { type: 'tool_use', id: 'call_2', name: 'weather', input: { day: 'friday' } },
+        ],
+      },
+      {
+        role: 'user',
+        content: [
+          { type: 'tool_result', tool_use_id: 'call_1', content: '7pm free' },
+          { type: 'tool_result', tool_use_id: 'call_2', content: 'clear' },
+        ],
+      },
+      { role: 'assistant', content: '7pm works.' },
+      { role: 'user', content: 'Book it.' },
+    ]);
+  });
+
+  it('turns a merged turn into blocks, keeps unparsable arguments, and still tags results without an id', () => {
+    const out = toAnthropic(
+      ctx({
+        recent: [
+          { role: 'assistant', content: '', toolCalls: [{ id: 'call_1', name: 'lookup', arguments: 'not json' }] },
+          { role: 'tool', toolCallId: 'call_1', content: 'found' },
+          { role: 'user', content: 'Thanks.' },
+          { role: 'tool', name: 'clock', content: 'noon' },
+        ],
+      }),
+    );
+    expect(out.messages).toEqual([
+      { role: 'user', content: '(continuing the conversation)' },
+      { role: 'assistant', content: [{ type: 'tool_use', id: 'call_1', name: 'lookup', input: { arguments: 'not json' } }] },
+      {
+        role: 'user',
+        content: [
+          { type: 'tool_result', tool_use_id: 'call_1', content: 'found' },
+          { type: 'text', text: 'Thanks.' },
+          { type: 'text', text: '[clock] noon' },
+        ],
+      },
+    ]);
+  });
+});
+
+describe('renderRecalled', () => {
+  it('shows tool calls as text after the message content', () => {
+    const memoryContext = ctx({
+      recalled: [
+        {
+          message: { id: 3, role: 'assistant', content: 'Checking.', toolCalls: [{ id: 'c', name: 'find', arguments: { q: 1 } }], at: 0, tokens: 4, compaction: 1 },
+          score: 0.5,
+        },
+      ],
+    });
+    expect(renderMemory({ summary: '', facts: [], recalled: memoryContext.recalled })).toBe(
+      '## Relevant earlier messages\n- assistant: Checking. [call find({"q":1})]',
+    );
   });
 });

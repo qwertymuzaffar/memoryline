@@ -15,8 +15,10 @@ import type {
   Store,
   StoredMessage,
   Summarizer,
+  ToolCall,
 } from './types.js';
 import { estimateTokens } from './tokens.js';
+import { messageText, toolGroupAt } from './tools.js';
 import { extractiveSummary } from './summarize.js';
 import { renderFacts, renderMemory } from './render.js';
 import { cosine } from './similarity.js';
@@ -93,18 +95,49 @@ export function assertSessionState(state: unknown): asserts state is SessionStat
   if (typeof s.id !== 'string' || !s.id) throw new TypeError('memoryline: session state needs an id');
 }
 
+function assertToolCalls(toolCalls: unknown): asserts toolCalls is ToolCall[] {
+  if (!Array.isArray(toolCalls)) throw new TypeError('memoryline: toolCalls must be an array');
+  for (const call of toolCalls) {
+    const { id, name, arguments: args } = (call ?? {}) as { id?: unknown; name?: unknown; arguments?: unknown };
+    if (typeof id !== 'string' || !id) throw new TypeError('memoryline: every tool call needs a string id');
+    if (typeof name !== 'string' || !name) throw new TypeError('memoryline: every tool call needs a string name');
+    const objectArgs = !!args && typeof args === 'object' && !Array.isArray(args);
+    if (typeof args !== 'string' && !objectArgs) throw new TypeError('memoryline: tool call arguments must be a string or an object');
+  }
+}
+
 function assertMessage(m: unknown): asserts m is Message {
   if (!m || typeof m !== 'object') throw new TypeError('memoryline: message must be an object');
-  const { role, content } = m as { role?: unknown; content?: unknown };
+  const { role, content, toolCalls, toolCallId } = m as { role?: unknown; content?: unknown; toolCalls?: unknown; toolCallId?: unknown };
   if (typeof role !== 'string' || !ROLES.has(role)) throw new TypeError(`memoryline: unknown message role ${String(role)}`);
   if (typeof content !== 'string') throw new TypeError('memoryline: message content must be a string');
+  if (toolCalls !== undefined) assertToolCalls(toolCalls);
+  if (toolCallId !== undefined && typeof toolCallId !== 'string') throw new TypeError('memoryline: toolCallId must be a string');
+}
+
+/** Copies the optional message fields that are stored as given. */
+function copyOptional(from: Message, to: Message): void {
+  if (from.name !== undefined) to.name = from.name;
+  if (from.toolCalls !== undefined) to.toolCalls = from.toolCalls;
+  if (from.toolCallId !== undefined) to.toolCallId = from.toolCallId;
+  if (from.meta !== undefined) to.meta = from.meta;
 }
 
 function toMessage(m: StoredMessage): Message {
   const out: Message = { role: m.role, content: m.content, at: m.at };
-  if (m.name !== undefined) out.name = m.name;
-  if (m.meta !== undefined) out.meta = m.meta;
+  copyOptional(m, out);
   return out;
+}
+
+/**
+ * Moves a fold boundary off the middle of a call/result group: forward past the group when
+ * keepRecent allows, otherwise back to the group's start so the whole group stays in the window.
+ */
+function wholeGroups(recent: StoredMessage[], boundary: number, keepRecent: number): number {
+  if (boundary <= 0 || boundary >= recent.length) return boundary;
+  const group = toolGroupAt(recent, boundary);
+  if (!group || group.start === boundary) return boundary;
+  return recent.length - group.end >= keepRecent ? group.end : group.start;
 }
 
 export function normalizeFactKey(key: string): string {
@@ -160,6 +193,7 @@ async function compact(core: Core, state: SessionState, force: boolean): Promise
   if (cfg.alignToUser) {
     while (n > 0 && n < recent.length && recent[n]!.role !== 'user' && recent.length - n > cfg.keepRecent) n++;
   }
+  n = wholeGroups(recent, n, cfg.keepRecent);
   if (n === 0) return none();
 
   const now = cfg.clock();
@@ -181,7 +215,7 @@ async function compact(core: Core, state: SessionState, force: boolean): Promise
   }
 
   let embeddings: number[][] | undefined;
-  if (cfg.embed) embeddings = await cfg.embed(folded.map((m) => m.content));
+  if (cfg.embed) embeddings = await cfg.embed(folded.map(messageText));
 
   const archived: ArchivedMessage[] = folded.map((m, i) => {
     const item: ArchivedMessage = { ...m, compaction };
@@ -246,10 +280,9 @@ export class Session {
           content: m.content,
           id: state.seq++,
           at: m.at ?? now,
-          tokens: cfg.countTokens(m.content) + cfg.perMessageOverhead,
+          tokens: cfg.countTokens(messageText(m)) + cfg.perMessageOverhead,
         };
-        if (m.name !== undefined) stored.name = m.name;
-        if (m.meta !== undefined) stored.meta = m.meta;
+        copyOptional(m, stored);
         state.recent.push(stored);
       }
       const result = await compact(this.core, state, false);

@@ -63,6 +63,13 @@ describe('prompts', () => {
     expect(text).toContain('Mia: Noted.');
   });
 
+  it('transcript and the extractive summary show tool calls as text', () => {
+    const call = { role: 'assistant' as const, content: 'One sec.', toolCalls: [{ id: 'c', name: 'find', arguments: { q: 1 } }] };
+    const bare = { role: 'assistant' as const, content: '', toolCalls: [{ id: 'c', name: 'find', arguments: '{"q":1}' }] };
+    expect(transcript([call, bare])).toBe('assistant: One sec. [call find({"q":1})]\nassistant: [call find({"q":1})]');
+    expect(extractiveSummary({ previousSummary: '', messages: [bare], facts: [], maxTokens: 100 })).toBe('- assistant: [call find({"q":1})]');
+  });
+
   it('transcript uses the name when present', () => {
     expect(transcript([{ role: 'user', content: ' hi ' }, { role: 'tool', name: 'calendar', content: 'ok' }])).toBe('user: hi\ncalendar: ok');
   });
